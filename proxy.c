@@ -11,6 +11,10 @@
 #include <errno.h>
 #include <netinet/tcp.h>
 
+#define MAX_CLIENTS 100
+int socket_descriptor;
+pid_t client_PID[MAX_CLIENTS];
+
 /* TODO: proxy()
  * Establish a socket connection to listen for incoming connections.
  * Accept each client request in a new process.
@@ -22,182 +26,276 @@
 
 // function used to parse the data 
 
-int parse_data(int child_descriptor){
-  int data_read; 
-  char buffer[100000];
-  char buf[100000];
-  int length = 0; 
 
-  data_read = read(child_descriptor, buf, 99999);
+//function used to check the version of the Https request 
 
-  if(data_read < 0){
-    perror("Error: Couldn't read from the buffer");
-  }
+int connectServer(char* host_name, int port){
 
-  length = strlen(buf);
+  int current_socket = socket(AF_INET, SOCK_STREAM, 0);
+  if(current_socket < 0) {
+    perror("Error: Couldn't create socket");
+    return -1;
+  } 
 
-  //parse the request 
-
-  //create a struct first to pass in parameters 
-  struct ParsedRequest*  request = ParsedRequest_create();
-  if (ParsedRequest_parse(request, buffer, length) < 0) {
-  sprintf(buffer,"HTTP/1.0 400 Bad Request\r\n\r\n");
-  int error_length = write(child_descriptor, buffer, strlen(buffer));
-  if(error_length < 0){
-    perror("Error: Couldn't write to the file descriptor");
+  //get the host name 
+  struct hostent *host = gethostbyname(host_name);
+  if(host == NULL) {
+    perror("Error: Host doesn't exist");
     return -1;
   }
 
-  // send the request to server by acting as the client 
-  int client_socket; 
-  int port;
   struct sockaddr_in server_address;
-  struct hostent *server_host; 
+	server_address.sin_family = AF_INET;
+	server_address.sin_port = htons(port);
 
-  //get the port number from the struct
-  if(request->port == NULL) {
+  if(connect(current_socket, (struct sockaddr*)&server_address, (socklen_t)sizeof(server_address)) < 0 )
+	{
+    perror("Error: Couldn't connect");
+    return -1;
+  }
+
+return current_socket;
+
+}
+
+int handleRequest(int clientSocket, struct ParsedRequest *request, char *client_buffer){
+
+  strcpy(client_buffer, "GET ");
+  strcat(client_buffer, request->path);
+  strcat(client_buffer, " ");
+  strcat(client_buffer, request->version);
+  strcat(client_buffer, "\r\n");
+
+  size_t length = strlen(client_buffer);
+
+  if (ParsedHeader_set(request, "Connection", "close") < 0){
+    perror("Error: Cannot set the connection");
+  }
+
+  if(ParsedHeader_get(request, "Host") == NULL){
+    if(ParsedHeader_set(request, "Host", request->host) < 0){
+       perror("Error: Cannot set the host");
+    }
+  }
+
+  if (ParsedRequest_unparse_headers(request, client_buffer + length, (size_t)4096 - length) < 0) {
+		perror("Error: Couldn't parse");
+	}
+
+  int port = 0; 
+
+  if(request->port == NULL){
     port = 80;
   } else {
     port = atoi(request->port);
   }
 
-  //create the socket 
-  client_socket = socket(AF_INET,SOCK_STREAM,0);
-  if(client_socket < 0) {
-    perror("Couldn't open socket in child proc");
+  int server_socket = connectServer(request->host, port);
+  if(server_socket < 0){
+    return -1; 
   }
 
-  server_address.sin_port = htons(port); 
-  server_address.sin_family = AF_INET;
-  server_address.sin_addr.s_addr = server_host->h_addr;
+  int bytes_sent = send(server_socket, client_buffer, strlen(client_buffer), 0);
+  bzero(client_buffer, 4096);
+  bytes_sent = recv(clientSocket, client_buffer, 4095, 0);
 
-  //connect to the server
-  int connection = connect(client_socket, (struct sockaddr *) &server_address, sizeof(server_address));
-
-  //check connection
-  if (connection == -1) {
-    perror("Error: Cannot connect");
-    return 1;
-  }
-
-  //edit the request to the server 
-  data_read = ParsedHeader_set(request,"Host",request->host);
-  if(data_read < 0) {
-    perror("Couldn't parse");
-  }
-
-  data_read = ParsedHeader_set(request, "Connection", "close");
-  if(data_read < 0) {
-    perror("Parse set couldn't close connection");
-  }
-
-  //add the null terminator to the result that needs to be sent to the client 
-  //get the length of the request
-  int len = ParsedRequest_totalLen(request);
-  char* terminate_buf = (char*) malloc (len + 1);
-  if(ParsedRequest_unparse(request, terminate_buf, len) < 0){
-    perror("Error: Couldn't unparse the header");
-  }
-
-  terminate_buf[len] = '\0';
-
-  //send request to server
-  int data_sent;
-
-  data_sent = write(client_socket, terminate_buf, len);
-
-  if(data_sent < 0) {
-    perror("Error: Couldn't write to the server");
-  }
-
-  //read the result from the server and send it to the client
-  while(1) {
-    memset(&buffer,0,100000);
-    data_read = read(client_socket, buffer, 99999);
-    if(data_read < 0) {
-      perror("Error: Couldn't read from server");
-    }
-    if(data_read == 0) {
+  while(bytes_sent > 0) {
+    bytes_sent = send(clientSocket, client_buffer, bytes_sent, 0);
+    if(bytes_sent < 0) {
+      perror("Error: cannot send data");
       break;
     }
+    bzero(client_buffer, 4096);
+    bytes_sent = recv(server_socket, client_buffer, 4095, 0);
+  }
 
-    data_read = write(child_descriptor, buffer, strlen(buffer));
-    if(data_read < 0) {
-      perror("Error: Couldn't write to client");
-    }
-  }
-  }
+  bzero(client_buffer, 4096);
+  close(server_socket);
   return 0; 
 }
 
 
-int proxy(char *proxy_port) {
-  //create a socket 
-  int proxy_socket; 
-  proxy_socket = socket(AF_INET, SOCK_STREAM, 0);
-
-  //check the connection of the server socket 
-
-  if(proxy_socket == -1) {
-    perror("Error: Connection error");
-    return 1; 
+int checkHttpsRequest(char *request) {
+  int version = 0; 
+  if(strncmp(request, "HTTP/1.0", 8) == 0){
+		version = 1;
+  } else {
+    version = -1; 
   }
+  return version; 
+}
 
-   //specify and address for a socket
-  int port = atoi(proxy_port);
-  struct sockaddr_in proxy_address;
-  proxy_address.sin_family = AF_INET;
-  proxy_address.sin_port = htons(port); 
-  proxy_address.sin_addr.s_addr = INADDR_ANY;
+int getMethod(char *method){
+  int type = 0; 
 
-  //bind the server 
-  int bind_descriptor = bind(proxy_socket, (struct sockaddr *) &proxy_address, sizeof(proxy_address));
-
-  //check the connection 
-  if(bind_descriptor == -1) {
-    perror("Error: Connection error");
-    return 1; 
+  if(strncmp(method, "GET\0",4) == 0) {
+    type = 1; 
+  } else {
+    type = -1; 
   }
+  return type;
+}
 
-   //listen for incoming connections
-  int listen_descriptor = listen(proxy_socket, 100);
-  int processes = 0; 
-  int fork_value = 0; 
 
-  //This is the proxy acting as the server
+void respond(int socket) {
+  char error_msg[1024];
 
-  while (processes <= 100) {
-    struct sockaddr_in client_address;
-    socklen_t length = sizeof(client_address);
-    int accept_descriptor = accept(proxy_socket, (struct sockaddr *) &client_address, &length);
-    
-    //check the connection - if estabilished if not try the next client
-    if(accept_descriptor < 0){
-      perror("Couldn't accept incoming connection");
+  int bytes_sent; 
+  int length; 
+  char *buffer = (char*)calloc(4096,sizeof(char));
+  bytes_sent = recv(socket, buffer, 4096, 0);
+  
+  while(bytes_sent > 0){
+    length = strlen(buffer);
+    if(strstr(buffer, "\r\n\r\n") == NULL) {
+      bytes_sent = recv(socket, buffer + length, 4096 - length, 0);
     } else {
-      // the connection has been accepted fork a new process for the new client 
-      fork_value = fork(); 
-
-      if(fork_value < 0) {
-        perror("Error: Could not create a process");
-        return 1;
-      }
-      // we are in the child process 
-      if(fork_value == 0) {
-        close(proxy_socket);
-        int process_id = getpid();
-        processes++;
-        //parse the request from the client once recieved 
-        int result = parse_data(accept_descriptor);
-      } else {
-        // we are in the parent process
-        close(accept_descriptor);
-      }
+      break; 
     }
   }
-
-  return 0;
+    if(bytes_sent > 0) {
+      length = strlen(buffer);
+      // parse the headers 
+      struct ParsedRequest *request = ParsedRequest_create();
+      if(ParsedRequest_parse(request, buffer, length) < 0) {
+        snprintf(error_msg, sizeof(error_msg),"HTTP/1.0 400 Bad Request\r\n\r\n");
+        send(socket, error_msg, strlen(error_msg), 0);
+      } else {
+        bzero(buffer, 4096);
+        //check the method type 
+        int type = getMethod(request->method); 
+        if(type == 1) {
+          //handle the get request 
+          if(request->host && request->path && (checkHttpsRequest(request->version) == 1)) {
+            bytes_sent = handleRequest(socket, request, buffer);
+            if(bytes_sent == -1){
+              send(socket, error_msg, strlen(error_msg), 0);
+            }
+          }
+        } else {
+          //send the error message for any other methods 
+          send(socket, error_msg, strlen(error_msg), 0);
+        }
+      }
+      ParsedRequest_destroy(request);
+    }
+    if(bytes_sent < 0) {
+      perror("Error: couldn't recieve data from client");
+    } else if(bytes_sent == 0) {
+      //client has closed the connection 
+    }
+    close(socket);
+    free(buffer);
+    return; 
 }
+
+int findChild(int i) {
+  int j = i;
+	pid_t ret_pid;
+	int child_state;
+
+	do
+	{
+		if(client_PID[j] == 0)
+			return j;
+		else
+		{
+			ret_pid = waitpid(client_PID[j], &child_state, WNOHANG);		// Finds status change of pid
+
+			if(ret_pid == client_PID[j]){
+				client_PID[j] = 0;
+				return j;
+        }
+			else if(ret_pid == 0)											// Child is still running
+			{
+				;
+			}
+			else
+				perror("Error in waitpid call\n");
+		}
+		j = (j+1)%MAX_CLIENTS;
+	}
+	while(j != i);
+	return -1;
+}
+
+int proxy(char *proxy_port){
+
+  int newSocket;
+  int port = atoi(proxy_port);
+  int socketId; 
+  int client_len;
+	struct sockaddr_in server_address;
+  struct sockaddr_in client_address;
+	bzero(client_PID, MAX_CLIENTS);
+
+  //creating the actual socket
+  socketId = socket(AF_INET,SOCK_STREAM,0);
+
+  if(socketId < 0) {
+    perror("Error: Couldn't create socket");
+    exit(1);
+  }
+
+  //Bind the socket
+  bzero((char*)&server_address, sizeof(server_address));
+  server_address.sin_family = AF_INET;
+	server_address.sin_port = htons(port);
+	server_address.sin_addr.s_addr = INADDR_ANY;
+
+  int bind_value = bind(socketId, (struct sockaddr*)&server_address, sizeof(server_address));
+	
+  if(bind_value < 0) {
+  	perror("Error : Port may not be free. Try Using diffrent port number.\n");
+		exit(1);
+	}
+
+  //Listen for connection ad accept up to 100 clients 
+  int status = listen(socketId, MAX_CLIENTS);
+
+  if(status < 0) {
+    perror("Error: Cannot listen to port");
+    exit(1);
+  }
+
+  //start accepting connections 
+  int i = 0; 
+  int req = 0; 
+
+  while(1){
+    bzero((char*)&client_address, sizeof(client_address));
+    client_len = sizeof(client_address);
+
+    newSocket = accept(socketId, (struct sockaddr *) &client_address, (socklen_t*)&client_len);
+    
+    if(newSocket < 0) {
+       perror("Error: Cannot create socket");
+       exit(1);
+    }
+
+    //forking new clients
+
+    i = findChild(i); 
+
+    if(i >= 0 && i < MAX_CLIENTS){
+      req = fork();
+      if(req == 0){
+        //creating the child process
+        respond(newSocket);
+        exit(0);
+      } else {
+        client_PID[i] = req;
+      }
+    } else {
+      i = 0; 
+      close(newSocket);
+    }
+  } 
+close(socketId);
+return 0; 
+}
+
+
 
 
 int main(int argc, char * argv[]) {
